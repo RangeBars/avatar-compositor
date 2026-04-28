@@ -4,6 +4,7 @@ import random
 import os
 import tempfile
 import uuid
+import re
 
 st.set_page_config(page_title="Avatar Video Toolkit", layout="centered")
 st.title("🎬 Avatar Video Toolkit")
@@ -49,6 +50,119 @@ def trim_video(path, max_seconds, tmpdir):
         "-c:a", "aac", out
     ], capture_output=True, check=True)
     return out
+
+def detect_silence_cuts(audio_path, min_silence_seconds=0.25, silence_db=-30):
+    """Returns list of timestamps (seconds) where speech pauses occur — natural cut points."""
+    cmd = [
+        "ffmpeg", "-i", audio_path,
+        "-af", f"silencedetect=noise={silence_db}dB:d={min_silence_seconds}",
+        "-f", "null", "-"
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    output = result.stderr
+    
+    # Parse silence_end events — these mark where speech resumes (good cut points)
+    cuts = []
+    for line in output.split("\n"):
+        match = re.search(r"silence_end:\s*([\d.]+)", line)
+        if match:
+            cuts.append(float(match.group(1)))
+    return cuts
+
+def composite_main_smart_cuts(bg_path, avatar_path, w, h, output_path, 
+                              min_pause=0.25, silence_db=-30, fallback_min_cut=2.0, fallback_max_cut=3.5):
+    """Composite avatar over background with cuts on natural speech pauses."""
+    duration = get_duration(avatar_path)
+    
+    # Detect speech pauses in the avatar's audio
+    pause_points = detect_silence_cuts(avatar_path, min_pause, silence_db)
+    
+    # Build cut segments from pause points, with a fallback timer if pauses are too sparse
+    cut_times = [0.0]
+    last = 0.0
+    for p in pause_points:
+        if p - last >= 1.5:  # don't cut more frequently than every 1.5s
+            cut_times.append(p)
+            last = p
+    
+    # If pauses are too rare (e.g., long monologue with no breaks), insert fallback cuts
+    final_cuts = [0.0]
+    for i in range(1, len(cut_times)):
+        gap = cut_times[i] - final_cuts[-1]
+        if gap > fallback_max_cut + 1.0:
+            # Fill the gap with fallback-timed cuts
+            t = final_cuts[-1] + random.uniform(fallback_min_cut, fallback_max_cut)
+            while t < cut_times[i]:
+                final_cuts.append(t)
+                t += random.uniform(fallback_min_cut, fallback_max_cut)
+        final_cuts.append(cut_times[i])
+    
+    # Make sure we extend to end of video
+    if final_cuts[-1] < duration - 1.0:
+        t = final_cuts[-1] + random.uniform(fallback_min_cut, fallback_max_cut)
+        while t < duration:
+            final_cuts.append(t)
+            t += random.uniform(fallback_min_cut, fallback_max_cut)
+    final_cuts.append(duration)
+    
+    # Build segments (start, end) from consecutive cut points
+    zones = [
+        (0.03, 0.05, 0.40),   # top-left small
+        (0.57, 0.05, 0.40),   # top-right small
+        (0.03, 0.55, 0.45),   # bottom-left medium
+        (0.55, 0.55, 0.45),   # bottom-right medium
+        (0.30, 0.30, 0.40),   # center small
+        (0.03, 0.30, 0.45),   # left middle
+        (0.55, 0.30, 0.45),   # right middle
+        (0.20, 0.50, 0.55),   # bottom-center large
+    ]
+    
+    segments = []
+    last_zone = None
+    for i in range(len(final_cuts) - 1):
+        start, end = final_cuts[i], final_cuts[i+1]
+        if end - start < 0.5:
+            continue  # skip super-short segments
+        available = [z for z in zones if z != last_zone]
+        zone = random.choice(available)
+        last_zone = zone
+        x = int(w * zone[0])
+        y = int(h * zone[1])
+        segments.append((start, end, x, y, zone[2]))
+    
+    if not segments:
+        # fallback: one segment for the whole video
+        zone = random.choice(zones)
+        segments = [(0, duration, int(w * zone[0]), int(h * zone[1]), zone[2])]
+    
+    filters = [
+        f"[0:v]scale={w}:{h},setsar=1[bg]",
+        "[1:v]colorkey=0x00FF00:0.30:0.15[keyed]"
+    ]
+    chain = "[bg]"
+    for i, (start, end, x, y, scale) in enumerate(segments):
+        sw = int(w * scale)
+        filters.append(f"[keyed]scale={sw}:-1[s{i}]")
+        next_label = f"[v{i}]" if i < len(segments) - 1 else "[outv]"
+        chain += f"[s{i}]overlay={x}:{y}:enable='between(t,{start:.2f},{end:.2f})'{next_label}"
+        if i < len(segments) - 1:
+            filters.append(chain)
+            chain = f"[v{i}]"
+    filters.append(chain)
+    full_filter = ";".join(filters)
+    
+    cmd = [
+        "ffmpeg", "-y", "-i", bg_path, "-i", avatar_path,
+        "-filter_complex", full_filter,
+        "-map", "[outv]", "-map", "1:a?",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-shortest", output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-2000:])
+    
+    return len(segments)
 
 def concat_videos(paths, w, h, output_path, tmpdir, crossfade_seconds=0):
     normalized = []
@@ -104,107 +218,88 @@ def concat_videos(paths, w, h, output_path, tmpdir, crossfade_seconds=0):
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-2000:])
 
-def composite_main(bg_path, avatar_path, w, h, min_cut, max_cut, output_path):
-    duration = get_duration(avatar_path)
-    zones = [
-        (0.03, 0.05, 0.40),
-        (0.57, 0.05, 0.40),
-        (0.03, 0.55, 0.45),
-        (0.55, 0.55, 0.45),
-        (0.30, 0.30, 0.40),
-        (0.03, 0.30, 0.45),
-        (0.55, 0.30, 0.45),
-        (0.20, 0.50, 0.55),
-    ]
-    segments = []
-    t = 0.0
-    last_zone = None
-    while t < duration:
-        seg_len = random.uniform(min_cut, max_cut)
-        end = min(t + seg_len, duration)
-        available = [z for z in zones if z != last_zone]
-        zone = random.choice(available)
-        last_zone = zone
-        x = int(w * zone[0])
-        y = int(h * zone[1])
-        segments.append((t, end, x, y, zone[2]))
-        t = end
-    
-    filters = [
-        f"[0:v]scale={w}:{h},setsar=1[bg]",
-        "[1:v]colorkey=0x00FF00:0.30:0.15[keyed]"
-    ]
-    chain = "[bg]"
-    for i, (start, end, x, y, scale) in enumerate(segments):
-        sw = int(w * scale)
-        filters.append(f"[keyed]scale={sw}:-1[s{i}]")
-        next_label = f"[v{i}]" if i < len(segments) - 1 else "[outv]"
-        chain += f"[s{i}]overlay={x}:{y}:enable='between(t,{start:.2f},{end:.2f})'{next_label}"
-        if i < len(segments) - 1:
-            filters.append(chain)
-            chain = f"[v{i}]"
-    filters.append(chain)
-    full_filter = ";".join(filters)
-    
-    cmd = [
-        "ffmpeg", "-y", "-i", bg_path, "-i", avatar_path,
-        "-filter_complex", full_filter,
-        "-map", "[outv]", "-map", "1:a?",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-        "-shortest", output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr[-2000:])
-
-# ============== TAB 1: HOOK BUILDER ==============
+# ============== TAB 1: HOOK BUILDER (BULK) ==============
 
 with tab1:
-    st.header("Build a finished hook")
-    st.write("Combine a hook clip with an end scene into one ready-to-use hook file.")
+    st.header("Build hooks in bulk")
+    st.write("Upload multiple Video A's and multiple Video B's. Get every combination, or N random pairings.")
     
-    hook_clip = st.file_uploader("Hook clip (the opener)", type=["mp4", "mov"], key="hb_hook")
-    end_scene = st.file_uploader("End scene (plays right after the hook)", type=["mp4", "mov"], key="hb_end")
+    video_a_files = st.file_uploader(
+        "Video A — hook openers (upload many variations)",
+        type=["mp4", "mov"], accept_multiple_files=True, key="hb_a"
+    )
+    video_b_files = st.file_uploader(
+        "Video B — end scenes (upload many variations)",
+        type=["mp4", "mov"], accept_multiple_files=True, key="hb_b"
+    )
+    
+    st.subheader("Settings")
+    pairing_mode = st.radio(
+        "How to pair them?",
+        ["Every combination (A × B)", "Random pairings (pick N)"],
+        key="hb_mode"
+    )
+    
+    if pairing_mode == "Random pairings (pick N)":
+        num_random = st.slider("How many random hook variations?", 1, 50, 10, key="hb_num")
+    
     hb_output_size = st.selectbox(
         "Output size",
         ["1080x1920 (vertical)", "1920x1080 (horizontal)", "1080x1080 (square)"],
         key="hb_size"
     )
-    hb_crossfade = st.checkbox("Crossfade between hook and end scene (0.3s fade)", value=False, key="hb_xfade")
+    hb_crossfade = st.checkbox("Crossfade between A and B (0.3s fade)", value=False, key="hb_xfade")
     
-    if st.button("🪝 Build Hook", type="primary", key="hb_btn"):
-        if not hook_clip or not end_scene:
-            st.error("Please upload both the hook clip and the end scene.")
+    if st.button("🪝 Build Hooks", type="primary", key="hb_btn"):
+        if not video_a_files or not video_b_files:
+            st.error("Please upload at least one Video A and one Video B.")
         else:
             tmpdir = tempfile.gettempdir()
             w, h = [int(x) for x in hb_output_size.split(" ")[0].split("x")]
             
-            with st.spinner("Building hook..."):
+            with st.spinner("Saving uploads..."):
+                a_paths = [(f.name, save_upload(f, tmpdir, "vidA")) for f in video_a_files]
+                b_paths = [(f.name, save_upload(f, tmpdir, "vidB")) for f in video_b_files]
+            
+            # Build pairing list
+            if pairing_mode == "Every combination (A × B)":
+                pairings = [(a, b) for a in a_paths for b in b_paths]
+            else:
+                pairings = [(random.choice(a_paths), random.choice(b_paths)) for _ in range(num_random)]
+            
+            st.info(f"Building {len(pairings)} hook variations...")
+            
+            progress = st.progress(0)
+            status = st.empty()
+            results = []
+            
+            for i, ((a_name, a_path), (b_name, b_path)) in enumerate(pairings):
+                status.text(f"Building {i+1} of {len(pairings)}: {a_name} + {b_name}")
                 try:
-                    hook_path = save_upload(hook_clip, tmpdir, "rawhook")
-                    end_path = save_upload(end_scene, tmpdir, "rawend")
                     job_id = uuid.uuid4().hex[:6]
-                    output_path = os.path.join(tmpdir, f"hook_finished_{job_id}.mp4")
-                    
+                    output_path = os.path.join(tmpdir, f"hook_{i+1}_{job_id}.mp4")
                     xfade = 0.3 if hb_crossfade else 0
-                    concat_videos([hook_path, end_path], w, h, output_path, tmpdir, crossfade_seconds=xfade)
-                    
-                    total_dur = get_duration(output_path)
-                    st.success(f"✅ Hook built — total length: {total_dur:.1f} seconds")
-                    
-                    with open(output_path, "rb") as f:
+                    concat_videos([a_path, b_path], w, h, output_path, tmpdir, crossfade_seconds=xfade)
+                    results.append((i+1, output_path, a_name, b_name))
+                except Exception as e:
+                    st.error(f"Hook {i+1} failed: {str(e)[:500]}")
+                
+                progress.progress((i+1) / len(pairings))
+            
+            status.text(f"✅ Done — {len(results)} hooks built.")
+            
+            for idx, path, a_name, b_name in results:
+                with st.expander(f"Hook {idx}: {a_name} + {b_name}", expanded=(idx == 1)):
+                    with open(path, "rb") as f:
                         video_bytes = f.read()
                     st.video(video_bytes)
                     st.download_button(
-                        "⬇️ Download Finished Hook",
+                        f"⬇️ Download Hook {idx}",
                         video_bytes,
-                        file_name=f"hook_{job_id}.mp4",
+                        file_name=f"hook_{idx}.mp4",
                         mime="video/mp4",
-                        key="hb_download"
+                        key=f"hbdl_{idx}"
                     )
-                    st.info("💡 Save this — upload it as a hook in the Variation Generator tab.")
-                except Exception as e:
-                    st.error(f"Build failed: {str(e)[:1000]}")
 
 # ============== TAB 2: BACKGROUND GENERATOR ==============
 
@@ -233,8 +328,6 @@ with tab2:
     if st.button("🌄 Generate Backgrounds", type="primary", key="bg_btn"):
         if not bg_library:
             st.error("Please upload at least one clip.")
-        elif not allow_repeats and len(bg_library) < 3:
-            st.warning("With repeats off, you'll likely run out of clips fast. Upload more clips or enable repeats.")
         else:
             tmpdir = tempfile.gettempdir()
             w, h = [int(x) for x in bg_output_size.split(" ")[0].split("x")]
@@ -272,10 +365,8 @@ with tab2:
                     
                     job_id = uuid.uuid4().hex[:6]
                     output_path = os.path.join(tmpdir, f"bg_generated_{v+1}_{job_id}.mp4")
-                    
                     xfade = 0.3 if bg_crossfade else 0
                     concat_videos(selected, w, h, output_path, tmpdir, crossfade_seconds=xfade)
-                    
                     final_path = trim_video(output_path, target_length, tmpdir)
                     final_dur = get_duration(final_path)
                     
@@ -300,11 +391,11 @@ with tab2:
                         key=f"bgdl_{idx}"
                     )
 
-# ============== TAB 3: VARIATION GENERATOR ==============
+# ============== TAB 3: VARIATION GENERATOR (smart cuts) ==============
 
 with tab3:
     st.header("Generate variations")
-    st.write("Combine finished hooks + HeyGen avatar + backgrounds into unique videos.")
+    st.write("Cuts land on natural speech pauses (between sentences and punch lines), not a fixed timer.")
     
     st.subheader("1. Upload your videos")
     hook_files = st.file_uploader(
@@ -316,14 +407,21 @@ with tab3:
         type=["mp4", "mov"], accept_multiple_files=True, key="vg_heygen"
     )
     bg_files = st.file_uploader(
-        "Background videos (use ones from Background Generator tab)",
+        "Background videos",
         type=["mp4", "mov"], accept_multiple_files=True, key="vg_bg"
     )
     
     st.subheader("2. Settings")
     num_variations = st.slider("How many unique variations?", 1, 10, 3, key="vg_num")
-    min_cut = st.slider("Shortest avatar cut (seconds)", 1.0, 5.0, 2.0, 0.5, key="vg_mincut")
-    max_cut = st.slider("Longest avatar cut (seconds)", 2.0, 8.0, 3.5, 0.5, key="vg_maxcut")
+    
+    with st.expander("⚙️ Advanced cut settings"):
+        min_pause = st.slider("Minimum pause length to count as a cut point (seconds)", 0.10, 1.0, 0.25, 0.05, key="vg_minpause",
+                              help="Shorter = more sensitive, more cuts. Longer = only major pauses become cuts.")
+        silence_db = st.slider("Silence threshold (dB)", -50, -15, -30, 1, key="vg_db",
+                               help="Lower (more negative) = stricter silence detection. -30 works for most HeyGen voices.")
+        fallback_min = st.slider("Fallback minimum cut (if no pauses found)", 1.0, 5.0, 2.0, 0.5, key="vg_fmin")
+        fallback_max = st.slider("Fallback maximum cut (if no pauses found)", 2.0, 8.0, 3.5, 0.5, key="vg_fmax")
+    
     vg_output_size = st.selectbox(
         "Output size",
         ["1080x1920 (vertical)", "1920x1080 (horizontal)", "1080x1080 (square)"],
@@ -357,10 +455,16 @@ with tab3:
                     main_path = os.path.join(tmpdir, f"main_{job_id}.mp4")
                     final_path = os.path.join(tmpdir, f"final_v{i+1}_{job_id}.mp4")
                     
-                    composite_main(bg, heygen, w, h, min_cut, max_cut, main_path)
+                    n_cuts = composite_main_smart_cuts(
+                        bg, heygen, w, h, main_path,
+                        min_pause=min_pause,
+                        silence_db=silence_db,
+                        fallback_min_cut=fallback_min,
+                        fallback_max_cut=fallback_max
+                    )
                     concat_videos([hook, main_path], w, h, final_path, tmpdir)
                     
-                    results.append((i+1, final_path, hook_name, hg_name, bg_name))
+                    results.append((i+1, final_path, hook_name, hg_name, bg_name, n_cuts))
                 except Exception as e:
                     st.error(f"Variation {i+1} failed: {str(e)[:500]}")
                 
@@ -368,8 +472,8 @@ with tab3:
             
             status.text(f"✅ Done — {len(results)} variations generated.")
             
-            for idx, path, hook_name, hg_name, bg_name in results:
-                with st.expander(f"Variation {idx}", expanded=(idx == 1)):
+            for idx, path, hook_name, hg_name, bg_name, n_cuts in results:
+                with st.expander(f"Variation {idx} ({n_cuts} cuts)", expanded=(idx == 1)):
                     st.caption(f"Hook: {hook_name} | HeyGen: {hg_name} | Background: {bg_name}")
                     with open(path, "rb") as f:
                         video_bytes = f.read()
