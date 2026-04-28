@@ -57,169 +57,60 @@ def detect_silence_cuts(audio_path, min_silence=0.25, silence_db=-30):
     return cuts
 
 
-def fit_background_to_length(bg_path, target_seconds, tmpdir):
-    """Loop background if shorter than target, trim if longer. Returns new path."""
+def fit_background_to_avatar(bg_path, avatar_path, w, h, tmpdir):
+    """Loop or trim background to exactly match avatar duration. Re-encode at target size."""
+    target_dur = get_duration(avatar_path)
     bg_dur = get_duration(bg_path)
+    
     suffix = uuid.uuid4().hex[:6]
     out = os.path.join(tmpdir, "bgfit_" + suffix + ".mp4")
     
-    if abs(bg_dur - target_seconds) < 0.5:
-        # Already roughly matches — just return original
-        return bg_path
+    # Always re-encode at the target canvas size (also handles aspect ratio properly)
+    scale_filter = (
+        "scale=" + str(w) + ":" + str(h) +
+        ":force_original_aspect_ratio=increase:flags=lanczos,crop=" +
+        str(w) + ":" + str(h) + ",setsar=1,fps=30"
+    )
     
-    if bg_dur < target_seconds:
-        # Loop until it covers target_seconds
+    if bg_dur < target_dur - 0.5:
+        # Loop to cover target duration
         cmd = [
             "ffmpeg", "-y",
             "-stream_loop", "-1", "-i", bg_path,
-            "-t", ("%.2f" % target_seconds),
+            "-t", ("%.2f" % target_dur),
+            "-vf", scale_filter,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-            "-c:a", "aac",
+            "-c:a", "aac", "-b:a", "128k",
             out
         ]
     else:
-        # Trim to target_seconds
+        # Trim to target duration (or just re-encode if equal)
         cmd = [
             "ffmpeg", "-y", "-i", bg_path,
-            "-t", ("%.2f" % target_seconds),
+            "-t", ("%.2f" % target_dur),
+            "-vf", scale_filter,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-            "-c:a", "aac",
+            "-c:a", "aac", "-b:a", "128k",
             out
         ]
     
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        # Fall back to original on error
-        return bg_path
+        raise RuntimeError("Background fit failed: " + result.stderr[-1000:])
     return out
 
 
-def prekey_avatar(avatar_path, key_color, key_tolerance, key_softness, tmpdir):
-    """Pre-render the chroma-keyed avatar once so it can be reused.
-    Returns path to the keyed video (with alpha)."""
-    suffix = uuid.uuid4().hex[:6]
-    out = os.path.join(tmpdir, "keyed_" + suffix + ".mov")
-    
-    key_filter = (
-        "colorkey=" + key_color + ":" +
-        ("%.2f" % key_tolerance) + ":" +
-        ("%.2f" % key_softness) +
-        ",format=yuva420p"
-    )
-    
-    cmd = [
-        "ffmpeg", "-y", "-i", avatar_path,
-        "-vf", key_filter,
-        "-c:v", "qtrle",  # lossless codec that supports alpha
-        "-c:a", "copy",
-        out
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        # qtrle not available, fall back to prores (also alpha-capable)
-        cmd = [
-            "ffmpeg", "-y", "-i", avatar_path,
-            "-vf", key_filter,
-            "-c:v", "prores_ks", "-pix_fmt", "yuva444p10le",
-            "-c:a", "copy",
-            out
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError("Pre-keying failed: " + result.stderr[-1500:])
-    return out
-
-
-def concat_videos_fast(paths, output_path, tmpdir):
-    """Use concat demuxer for near-instant joining when formats match."""
-    # Write a concat list file
-    list_path = os.path.join(tmpdir, "concat_" + uuid.uuid4().hex[:6] + ".txt")
-    with open(list_path, "w") as f:
-        for p in paths:
-            f.write("file '" + p.replace("'", r"'\''") + "'\n")
-    
-    # Try stream copy first (fastest — no re-encode)
-    cmd_copy = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0", "-i", list_path,
-        "-c", "copy",
-        output_path
-    ]
-    result = subprocess.run(cmd_copy, capture_output=True, text=True)
-    if result.returncode == 0:
-        return
-    
-    # Stream copy failed (formats don't match) — fall back to re-encode
-    return concat_videos_reencode(paths, output_path, tmpdir)
-
-
-def concat_videos_reencode(paths, output_path, tmpdir, target_w=None, target_h=None):
-    """Re-encode concat — slower but handles mismatched formats."""
-    normalized = []
-    for p in paths:
-        if not has_audio(p):
-            p = add_silent_audio(p, tmpdir)
-        normalized.append(p)
-    
-    n = len(normalized)
-    inputs = []
-    for p in normalized:
-        inputs.extend(["-i", p])
-    
-    parts = []
-    concat_str = ""
-    if target_w and target_h:
-        scale_str = (
-            "scale=" + str(target_w) + ":" + str(target_h) +
-            ":force_original_aspect_ratio=decrease:flags=lanczos,pad=" +
-            str(target_w) + ":" + str(target_h) +
-            ":(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30"
-        )
-    else:
-        scale_str = "setsar=1,fps=30"
-    
-    for i in range(n):
-        idx = str(i)
-        parts.append("[" + idx + ":v]" + scale_str + "[v" + idx + "]")
-        concat_str += "[v" + idx + "][" + idx + ":a]"
-    parts.append(concat_str + "concat=n=" + str(n) + ":v=1:a=1[outv][outa]")
-    full_filter = ";".join(parts)
-    
-    cmd = ["ffmpeg", "-y"] + inputs + [
-        "-filter_complex", full_filter,
-        "-map", "[outv]", "-map", "[outa]",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-        "-c:a", "aac",
-        output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr[-1500:])
-
-
-def composite_avatar(bg_path, avatar_path, keyed_avatar_path, w, h, output_path,
+def composite_avatar(bg_fitted_path, avatar_path, w, h, output_path,
+                     key_color, key_tolerance, key_softness,
                      bg_audio_volume,
-                     min_pause=0.25, silence_db=-30, fb_min=2.0, fb_max=3.5,
-                     tmpdir=None):
+                     min_pause=0.25, silence_db=-30, fb_min=2.0, fb_max=3.5):
     """
-    Composite pre-keyed avatar over background with cuts on speech pauses.
-    
-    bg_path: original background (used for length matching)
-    avatar_path: original avatar (used for audio + duration + silence detection)
-    keyed_avatar_path: pre-keyed avatar with alpha channel
-    bg_audio_volume: 0.0 to 1.0
+    Composite avatar over already-fitted background.
+    bg_fitted_path: background already looped/trimmed to avatar length and at target size
     """
-    if tmpdir is None:
-        tmpdir = os.path.dirname(output_path)
-    
     duration = get_duration(avatar_path)
-    
-    # Loop or trim the background to match avatar length
-    bg_fitted = fit_background_to_length(bg_path, duration, tmpdir)
-    
     pauses = detect_silence_cuts(avatar_path, min_pause, silence_db)
 
-    # Build cut points
     cuts = [0.0]
     last = 0.0
     for p in pauses:
@@ -279,21 +170,24 @@ def composite_avatar(bg_path, avatar_path, keyed_avatar_path, w, h, output_path,
 
     n_segs = len(segments)
     
-    # Build filter chain
+    # Filter chain
     parts = []
+    
+    # Background already fitted, just ensure SAR
+    parts.append("[0:v]setsar=1,fps=30[bg]")
+    
+    # Key the avatar then split into N copies
     parts.append(
-        "[0:v]scale=" + str(w) + ":" + str(h) +
-        ":force_original_aspect_ratio=increase:flags=lanczos,crop=" + str(w) + ":" + str(h) +
-        ",setsar=1,fps=30[bg]"
+        "[1:v]colorkey=" + key_color + ":" +
+        ("%.2f" % key_tolerance) + ":" +
+        ("%.2f" % key_softness) + ",format=yuva420p[keyed]"
     )
     
-    # Split keyed avatar into N copies
     split_outputs = ""
     for i in range(n_segs):
         split_outputs += "[k" + str(i) + "]"
-    parts.append("[1:v]split=" + str(n_segs) + split_outputs)
+    parts.append("[keyed]split=" + str(n_segs) + split_outputs)
     
-    # Scale each copy with lanczos
     for i in range(n_segs):
         seg = segments[i]
         scale = seg[4]
@@ -301,7 +195,6 @@ def composite_avatar(bg_path, avatar_path, keyed_avatar_path, w, h, output_path,
         idx = str(i)
         parts.append("[k" + idx + "]scale=" + str(sw) + ":-2:flags=lanczos[s" + idx + "]")
     
-    # Chain overlays
     chain_input = "[bg]"
     for i in range(n_segs):
         seg = segments[i]
@@ -324,44 +217,83 @@ def composite_avatar(bg_path, avatar_path, keyed_avatar_path, w, h, output_path,
         chain_input = "[v" + idx + "]"
     
     # Audio handling
-    bg_for_input = bg_fitted
-    avatar_input_idx = "2"  # avatar audio comes from third input (original avatar)
-    
     if bg_audio_volume > 0:
-        if not has_audio(bg_for_input):
-            bg_for_input = add_silent_audio(bg_for_input, tmpdir)
+        if not has_audio(bg_fitted_path):
+            bg_fitted_path = add_silent_audio(bg_fitted_path, os.path.dirname(output_path))
         parts.append(
             "[0:a]volume=" + ("%.2f" % bg_audio_volume) + "[bga]"
         )
-        parts.append(
-            "[" + avatar_input_idx + ":a]volume=1.0[ava]"
-        )
+        parts.append("[1:a]volume=1.0[ava]")
         parts.append(
             "[bga][ava]amix=inputs=2:duration=shortest:dropout_transition=0[outa]"
         )
         audio_map = "[outa]"
     else:
-        audio_map = avatar_input_idx + ":a?"
+        audio_map = "1:a?"
     
     full_filter = ";".join(parts)
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", bg_for_input,
-        "-i", keyed_avatar_path,
+        "-i", bg_fitted_path,
         "-i", avatar_path,
         "-filter_complex", full_filter,
         "-map", "[outv]",
         "-map", audio_map,
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-        "-c:a", "aac",
-        "-shortest", output_path
+        "-c:a", "aac", "-b:a", "128k",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-t", ("%.2f" % duration),
+        output_path
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(result.stderr[-2000:])
+        raise RuntimeError("Composite failed: " + result.stderr[-1500:])
 
     return n_segs
+
+
+def concat_videos(paths, w, h, output_path, tmpdir):
+    """Concatenate videos by re-encoding to ensure compatibility. Uses ultrafast preset."""
+    normalized = []
+    for p in paths:
+        if not has_audio(p):
+            p = add_silent_audio(p, tmpdir)
+        normalized.append(p)
+
+    n = len(normalized)
+    inputs = []
+    for p in normalized:
+        inputs.extend(["-i", p])
+
+    parts = []
+    concat_str = ""
+    scale_str = (
+        "scale=" + str(w) + ":" + str(h) +
+        ":force_original_aspect_ratio=decrease:flags=lanczos,pad=" +
+        str(w) + ":" + str(h) +
+        ":(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30"
+    )
+    for i in range(n):
+        idx = str(i)
+        parts.append("[" + idx + ":v]" + scale_str + "[v" + idx + "]")
+        concat_str += "[v" + idx + "][" + idx + ":a]"
+    parts.append(concat_str + "concat=n=" + str(n) + ":v=1:a=1[outv][outa]")
+    full_filter = ";".join(parts)
+
+    cmd = ["ffmpeg", "-y"] + inputs + [
+        "-filter_complex", full_filter,
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+        "-c:a", "aac", "-b:a", "128k",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError("Concat failed: " + result.stderr[-1500:])
 
 
 def parse_size(s):
@@ -420,20 +352,15 @@ key_mode = st.radio(
 )
 
 if key_mode == "Custom color":
-    custom_hex = st.text_input("Hex color to remove (e.g., 0xFF00FF for magenta)", value="0x00FF00", key="customhex")
+    custom_hex = st.text_input("Hex color to remove", value="0x00FF00", key="customhex")
 
 key_tolerance = st.slider(
-    "Keying tolerance (higher = removes more)", 0.10, 0.50, 0.30, 0.05, key="ktol",
-    help="If you see edges of background color around the avatar, increase this. If parts of the avatar disappear, decrease."
+    "Keying tolerance (higher = removes more)", 0.10, 0.50, 0.30, 0.05, key="ktol"
 )
-key_softness = st.slider(
-    "Edge softness", 0.0, 0.50, 0.15, 0.05, key="ksoft",
-    help="Higher = softer/smoother edges around the avatar."
-)
+key_softness = st.slider("Edge softness", 0.0, 0.50, 0.15, 0.05, key="ksoft")
 
 bg_audio_volume = st.slider(
-    "Background video audio volume", 0.0, 1.0, 0.30, 0.05, key="bgvol",
-    help="0 = mute background. 1.0 = full volume. Recommended: 0.20 to 0.40."
+    "Background video audio volume", 0.0, 1.0, 0.30, 0.05, key="bgvol"
 )
 
 with st.expander("Advanced cut settings (avatar movement)"):
@@ -442,7 +369,6 @@ with st.expander("Advanced cut settings (avatar movement)"):
     fb_min = st.slider("Fallback minimum cut (seconds)", 1.0, 5.0, 2.0, 0.5, key="fmin")
     fb_max = st.slider("Fallback maximum cut (seconds)", 2.0, 8.0, 3.5, 0.5, key="fmax")
 
-# Show the math
 if hook_files and bg_files and heygen_files:
     total_combos = len(hook_files) * len(bg_files) * len(heygen_files)
     st.info(
@@ -451,6 +377,7 @@ if hook_files and bg_files and heygen_files:
         str(len(heygen_files)) + " HeyGen videos. " +
         "Total possible combinations: " + str(total_combos)
     )
+
 
 # ============== ACTIVATE ==============
 
@@ -467,7 +394,6 @@ if st.button("ACTIVATE — Generate Videos", type="primary", key="activate"):
         tmpdir = tempfile.gettempdir()
         w, h = parse_size(output_size)
 
-        # Determine key color
         if key_mode.startswith("Green"):
             key_color = "0x00FF00"
         elif key_mode.startswith("White"):
@@ -477,7 +403,6 @@ if st.button("ACTIVATE — Generate Videos", type="primary", key="activate"):
             if not key_color.startswith("0x"):
                 key_color = "0x" + key_color.lstrip("#").lstrip("0x")
 
-        # Save uploads
         with st.spinner("Saving uploads..."):
             hook_list = []
             for f in hook_files:
@@ -490,18 +415,20 @@ if st.button("ACTIVATE — Generate Videos", type="primary", key="activate"):
             for f in heygen_files:
                 heygen_list.append((f.name, save_upload(f, tmpdir, "hg")))
 
-        # Pre-key all avatars once (huge speedup when reused)
-        with st.spinner("Pre-keying avatars (one-time per avatar)..."):
-            keyed_avatars = {}
-            for name, path in heygen_list:
-                try:
-                    keyed_path = prekey_avatar(path, key_color, key_tolerance, key_softness, tmpdir)
-                    keyed_avatars[path] = keyed_path
-                except Exception as e:
-                    st.error("Pre-keying failed for " + name + ": " + str(e)[:300])
-                    keyed_avatars[path] = None
+        # Pre-fit each (background, avatar) pair so backgrounds match avatar lengths
+        # Cache: key is (bg_path, avatar_path), value is fitted_bg_path
+        fit_cache = {}
+        with st.spinner("Pre-fitting backgrounds to avatar lengths..."):
+            for hg_name, hg_path in heygen_list:
+                for bg_name, bg_path in bg_list:
+                    cache_key = (bg_path, hg_path)
+                    try:
+                        fitted = fit_background_to_avatar(bg_path, hg_path, w, h, tmpdir)
+                        fit_cache[cache_key] = fitted
+                    except Exception as e:
+                        st.warning("Could not pre-fit " + bg_name + " for " + hg_name + ": " + str(e)[:200])
+                        fit_cache[cache_key] = None
 
-        # Build the list of combinations to generate
         all_combos = list(itertools.product(hook_list, bg_list, heygen_list))
 
         if generation_mode == "All possible combinations":
@@ -535,10 +462,10 @@ if st.button("ACTIVATE — Generate Videos", type="primary", key="activate"):
             bg_path = bg_pair[1]
             hg_name = hg_pair[0]
             hg_path = hg_pair[1]
-            keyed_path = keyed_avatars.get(hg_path)
             
-            if keyed_path is None:
-                st.error("Variation " + str(i + 1) + " skipped: avatar pre-keying failed")
+            fitted_bg = fit_cache.get((bg_path, hg_path))
+            if fitted_bg is None:
+                st.error("Variation " + str(i + 1) + " skipped: background prep failed")
                 prog.progress((i + 1) / len(combos_to_make))
                 continue
 
@@ -548,26 +475,17 @@ if st.button("ACTIVATE — Generate Videos", type="primary", key="activate"):
                 suffix1 = uuid.uuid4().hex[:6]
                 main_path = os.path.join(tmpdir, "main_" + suffix1 + ".mp4")
                 num_cuts = composite_avatar(
-                    bg_path, hg_path, keyed_path, w, h, main_path,
-                    bg_audio_volume,
-                    min_pause, silence_db, fb_min, fb_max,
-                    tmpdir
+                    fitted_bg, hg_path, w, h, main_path,
+                    key_color, key_tolerance, key_softness, bg_audio_volume,
+                    min_pause, silence_db, fb_min, fb_max
                 )
 
                 suffix2 = uuid.uuid4().hex[:6]
                 final_path = os.path.join(tmpdir, "final_" + str(i + 1) + "_" + suffix2 + ".mp4")
-                
-                # Try fast concat first; falls back to re-encode if formats mismatch
-                try:
-                    concat_videos_fast(
-                        [hook_path, transition_path, main_path],
-                        final_path, tmpdir
-                    )
-                except Exception:
-                    concat_videos_reencode(
-                        [hook_path, transition_path, main_path],
-                        final_path, tmpdir, w, h
-                    )
+                concat_videos(
+                    [hook_path, transition_path, main_path],
+                    w, h, final_path, tmpdir
+                )
 
                 results.append((i + 1, final_path, hook_name, bg_name, hg_name, num_cuts))
             except Exception as e:
