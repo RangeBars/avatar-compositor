@@ -7,10 +7,9 @@ import uuid
 import re
 import itertools
 
-st.set_page_config(page_title="Avatar Video Toolkit", layout="centered")
-st.title("Avatar Video Toolkit")
-
-tab1, tab2, tab3 = st.tabs(["Hook Builder", "Background Generator", "Variation Generator"])
+st.set_page_config(page_title="Avatar Video Generator", layout="centered")
+st.title("Avatar Video Generator")
+st.write("Upload your assets, click Activate, get unlimited unique variations.")
 
 
 # ============== HELPERS ==============
@@ -153,8 +152,13 @@ def composite_avatar(bg_path, avatar_path, w, h, output_path, min_pause=0.25, si
     parts.append("[1:v]colorkey=0x00FF00:0.30:0.15[keyed]")
 
     chain = "[bg]"
-    for i, seg in enumerate(segments):
-        start, end, x, y, scale = seg
+    for i in range(len(segments)):
+        seg = segments[i]
+        start = seg[0]
+        end = seg[1]
+        x = seg[2]
+        y = seg[3]
+        scale = seg[4]
         idx = str(i)
         sw = int(w * scale)
         parts.append("[keyed]scale=" + str(sw) + ":-1[s" + idx + "]")
@@ -191,221 +195,174 @@ def parse_size(s):
     return int(nums[0]), int(nums[1])
 
 
-def factorial(n):
-    result = 1
-    for i in range(2, n + 1):
-        result *= i
-    return result
+# ============== UI ==============
 
+st.subheader("1. Hook section")
+hook_files = st.file_uploader(
+    "Hook intro variations (upload many)",
+    type=["mp4", "mov"], accept_multiple_files=True, key="hooks"
+)
+transition_file = st.file_uploader(
+    "Binding transition (one video — connects hook to background)",
+    type=["mp4", "mov"], key="transition"
+)
 
-# ============== TAB 1: HOOK BUILDER ==============
+st.subheader("2. Main section")
+bg_files = st.file_uploader(
+    "Background videos (upload many)",
+    type=["mp4", "mov"], accept_multiple_files=True, key="backgrounds"
+)
+heygen_files = st.file_uploader(
+    "HeyGen avatar videos with green screen (upload one or more)",
+    type=["mp4", "mov"], accept_multiple_files=True, key="heygen"
+)
 
-with tab1:
-    st.header("Hook Builder")
-    st.write("Upload many Video A's and one Video B. Each output: Video B then Video A.")
+st.subheader("3. Settings")
 
-    a_files = st.file_uploader("Video A files (upload many variations)", type=["mp4", "mov"], accept_multiple_files=True, key="a")
-    b_file = st.file_uploader("Video B (upload one - plays first)", type=["mp4", "mov"], key="b")
+col1, col2 = st.columns(2)
+with col1:
+    output_size = st.selectbox(
+        "Output size",
+        ["1080x1920 (vertical)", "1920x1080 (horizontal)", "1080x1080 (square)"],
+        key="size"
+    )
+with col2:
+    generation_mode = st.radio(
+        "Generation mode",
+        ["All possible combinations", "Set number of random variations"],
+        key="mode"
+    )
 
-    size1 = st.selectbox("Output size", ["1080x1920 (vertical)", "1920x1080 (horizontal)", "1080x1080 (square)"], key="hbsize")
+if generation_mode == "Set number of random variations":
+    num_variations = st.slider("How many variations?", 1, 50, 10, key="numvar")
+else:
+    max_combos = st.slider("Max combinations to generate (safety cap)", 1, 100, 30, key="maxcombo")
 
-    if st.button("Build Hooks", type="primary", key="hbbtn"):
-        if not a_files or not b_file:
-            st.error("Upload at least one Video A and one Video B.")
+with st.expander("Advanced cut settings (avatar movement)"):
+    min_pause = st.slider("Minimum pause for cut (seconds)", 0.10, 1.0, 0.25, 0.05, key="minpause")
+    silence_db = st.slider("Silence threshold (dB)", -50, -15, -30, 1, key="db")
+    fb_min = st.slider("Fallback minimum cut (seconds)", 1.0, 5.0, 2.0, 0.5, key="fmin")
+    fb_max = st.slider("Fallback maximum cut (seconds)", 2.0, 8.0, 3.5, 0.5, key="fmax")
+
+# Show the math
+if hook_files and bg_files and heygen_files:
+    total_combos = len(hook_files) * len(bg_files) * len(heygen_files)
+    st.info(
+        "You have " + str(len(hook_files)) + " hooks, " +
+        str(len(bg_files)) + " backgrounds, and " +
+        str(len(heygen_files)) + " HeyGen videos. " +
+        "Total possible combinations: " + str(total_combos)
+    )
+
+# ============== ACTIVATE ==============
+
+if st.button("ACTIVATE — Generate Videos", type="primary", key="activate"):
+    if not hook_files:
+        st.error("Please upload at least one hook intro.")
+    elif not transition_file:
+        st.error("Please upload the binding transition video.")
+    elif not bg_files:
+        st.error("Please upload at least one background video.")
+    elif not heygen_files:
+        st.error("Please upload at least one HeyGen avatar video.")
+    else:
+        tmpdir = tempfile.gettempdir()
+        w, h = parse_size(output_size)
+
+        # Save uploads
+        with st.spinner("Saving uploads..."):
+            hook_list = []
+            for f in hook_files:
+                hook_list.append((f.name, save_upload(f, tmpdir, "hook")))
+            transition_path = save_upload(transition_file, tmpdir, "trans")
+            bg_list = []
+            for f in bg_files:
+                bg_list.append((f.name, save_upload(f, tmpdir, "bg")))
+            heygen_list = []
+            for f in heygen_files:
+                heygen_list.append((f.name, save_upload(f, tmpdir, "hg")))
+
+        # Build the list of combinations to generate
+        all_combos = list(itertools.product(hook_list, bg_list, heygen_list))
+
+        if generation_mode == "All possible combinations":
+            if len(all_combos) > max_combos:
+                random.shuffle(all_combos)
+                combos_to_make = all_combos[:max_combos]
+            else:
+                combos_to_make = all_combos
         else:
-            tmpdir = tempfile.gettempdir()
-            w, h = parse_size(size1)
+            combos_to_make = []
+            for i in range(num_variations):
+                combos_to_make.append((
+                    random.choice(hook_list),
+                    random.choice(bg_list),
+                    random.choice(heygen_list)
+                ))
 
-            with st.spinner("Saving uploads..."):
-                a_paths = []
-                for f in a_files:
-                    a_paths.append((f.name, save_upload(f, tmpdir, "a")))
-                b_path = save_upload(b_file, tmpdir, "b")
+        st.info("Generating " + str(len(combos_to_make)) + " final videos. This may take a few minutes.")
+        prog = st.progress(0)
+        status = st.empty()
+        results = []
 
-            st.info("Building " + str(len(a_paths)) + " hooks...")
-            prog = st.progress(0)
-            status = st.empty()
-            results = []
+        for i in range(len(combos_to_make)):
+            combo = combos_to_make[i]
+            hook_pair = combo[0]
+            bg_pair = combo[1]
+            hg_pair = combo[2]
+            hook_name = hook_pair[0]
+            hook_path = hook_pair[1]
+            bg_name = bg_pair[0]
+            bg_path = bg_pair[1]
+            hg_name = hg_pair[0]
+            hg_path = hg_pair[1]
 
-            for i in range(len(a_paths)):
-                an = a_paths[i][0]
-                ap = a_paths[i][1]
-                status.text("Building " + str(i + 1) + " of " + str(len(a_paths)) + ": B + " + an)
-                try:
-                    suffix = uuid.uuid4().hex[:6]
-                    out_path = os.path.join(tmpdir, "hook_" + str(i + 1) + "_" + suffix + ".mp4")
-                    concat_videos([b_path, ap], w, h, out_path, tmpdir)
-                    results.append((i + 1, out_path, an))
-                except Exception as e:
-                    st.error("Hook " + str(i + 1) + " failed: " + str(e)[:300])
-                prog.progress((i + 1) / len(a_paths))
+            status.text("Generating " + str(i + 1) + " of " + str(len(combos_to_make)))
 
-            status.text("Done. " + str(len(results)) + " hooks built.")
+            try:
+                # Step 1: composite avatar onto background
+                suffix1 = uuid.uuid4().hex[:6]
+                main_path = os.path.join(tmpdir, "main_" + suffix1 + ".mp4")
+                num_cuts = composite_avatar(
+                    bg_path, hg_path, w, h, main_path,
+                    min_pause, silence_db, fb_min, fb_max
+                )
 
-            for r in results:
-                idx = r[0]
-                path = r[1]
-                an = r[2]
-                with st.expander("Hook " + str(idx) + ": B + " + an, expanded=(idx == 1)):
-                    with open(path, "rb") as f:
-                        data = f.read()
-                    st.video(data)
-                    st.download_button("Download Hook " + str(idx), data,
-                                       file_name="hook_" + str(idx) + ".mp4",
-                                       mime="video/mp4", key="hbdl_" + str(idx))
+                # Step 2: concat hook + transition + composited main
+                suffix2 = uuid.uuid4().hex[:6]
+                final_path = os.path.join(tmpdir, "final_" + str(i + 1) + "_" + suffix2 + ".mp4")
+                concat_videos(
+                    [hook_path, transition_path, main_path],
+                    w, h, final_path, tmpdir
+                )
 
+                results.append((i + 1, final_path, hook_name, bg_name, hg_name, num_cuts))
+            except Exception as e:
+                err_msg = str(e)[:300]
+                st.error("Variation " + str(i + 1) + " failed: " + err_msg)
 
-# ============== TAB 2: BACKGROUND GENERATOR ==============
+            prog.progress((i + 1) / len(combos_to_make))
 
-with tab2:
-    st.header("Background Generator")
-    st.write("Upload background clips. Generates every possible order (permutation), capped by your max.")
+        status.text("Done. " + str(len(results)) + " videos generated.")
 
-    bg_lib = st.file_uploader("Background clips", type=["mp4", "mov"], accept_multiple_files=True, key="bglib")
-
-    if bg_lib:
-        n_clips = len(bg_lib)
-        total_perms = factorial(n_clips)
-        st.info("With " + str(n_clips) + " clips, there are " + str(total_perms) + " possible orderings.")
-
-    max_output = st.slider("Max number of variations to generate", 1, 50, 10, key="bgmax")
-    size2 = st.selectbox("Output size", ["1080x1920 (vertical)", "1920x1080 (horizontal)", "1080x1080 (square)"], key="bgsize")
-
-    if st.button("Generate Backgrounds", type="primary", key="bgbtn"):
-        if not bg_lib or len(bg_lib) < 2:
-            st.error("Upload at least 2 clips.")
-        else:
-            tmpdir = tempfile.gettempdir()
-            w, h = parse_size(size2)
-
-            with st.spinner("Saving uploads..."):
-                lib = []
-                for f in bg_lib:
-                    lib.append((f.name, save_upload(f, tmpdir, "lib")))
-
-            all_perms = list(itertools.permutations(lib))
-            if len(all_perms) > max_output:
-                all_perms = random.sample(all_perms, max_output)
-
-            st.info("Generating " + str(len(all_perms)) + " variations...")
-            prog = st.progress(0)
-            status = st.empty()
-            results = []
-
-            for v in range(len(all_perms)):
-                perm = all_perms[v]
-                names = []
-                paths = []
-                for p in perm:
-                    names.append(p[0])
-                    paths.append(p[1])
-                status.text("Generating " + str(v + 1) + " of " + str(len(all_perms)) + ": " + " > ".join(names))
-                try:
-                    suffix = uuid.uuid4().hex[:6]
-                    out_path = os.path.join(tmpdir, "bg_" + str(v + 1) + "_" + suffix + ".mp4")
-                    concat_videos(paths, w, h, out_path, tmpdir)
-                    results.append((v + 1, out_path, names))
-                except Exception as e:
-                    st.error("Background " + str(v + 1) + " failed: " + str(e)[:300])
-                prog.progress((v + 1) / len(all_perms))
-
-            status.text("Done. " + str(len(results)) + " backgrounds generated.")
-
-            for r in results:
-                idx = r[0]
-                path = r[1]
-                names = r[2]
-                with st.expander("Background " + str(idx) + ": " + " > ".join(names), expanded=(idx == 1)):
-                    with open(path, "rb") as f:
-                        data = f.read()
-                    st.video(data)
-                    st.download_button("Download Background " + str(idx), data,
-                                       file_name="background_" + str(idx) + ".mp4",
-                                       mime="video/mp4", key="bgdl_" + str(idx))
-
-
-# ============== TAB 3: VARIATION GENERATOR ==============
-
-with tab3:
-    st.header("Variation Generator")
-    st.write("Combine hooks + HeyGen avatar (green screen) + backgrounds. Cuts land on speech pauses.")
-
-    hooks = st.file_uploader("Finished hooks (from Tab 1)", type=["mp4", "mov"], accept_multiple_files=True, key="vghk")
-    avs = st.file_uploader("HeyGen avatar videos (green screen)", type=["mp4", "mov"], accept_multiple_files=True, key="vgav")
-    bgs = st.file_uploader("Backgrounds (from Tab 2)", type=["mp4", "mov"], accept_multiple_files=True, key="vgbg")
-
-    nvar = st.slider("How many variations?", 1, 20, 5, key="vgnum")
-
-    with st.expander("Advanced cut settings"):
-        mp_v = st.slider("Min pause for cut (seconds)", 0.10, 1.0, 0.25, 0.05, key="vgmp")
-        db_v = st.slider("Silence threshold (dB)", -50, -15, -30, 1, key="vgdb")
-        fmin_v = st.slider("Fallback min cut", 1.0, 5.0, 2.0, 0.5, key="vgfmin")
-        fmax_v = st.slider("Fallback max cut", 2.0, 8.0, 3.5, 0.5, key="vgfmax")
-
-    size3 = st.selectbox("Output size", ["1080x1920 (vertical)", "1920x1080 (horizontal)", "1080x1080 (square)"], key="vgsize")
-
-    if st.button("Generate Variations", type="primary", key="vgbtn"):
-        if not hooks or not avs or not bgs:
-            st.error("Upload at least one hook, one avatar, and one background.")
-        else:
-            tmpdir = tempfile.gettempdir()
-            w, h = parse_size(size3)
-
-            with st.spinner("Saving uploads..."):
-                hk = []
-                for f in hooks:
-                    hk.append((f.name, save_upload(f, tmpdir, "hk")))
-                av = []
-                for f in avs:
-                    av.append((f.name, save_upload(f, tmpdir, "av")))
-                bg = []
-                for f in bgs:
-                    bg.append((f.name, save_upload(f, tmpdir, "bg")))
-
-            prog = st.progress(0)
-            status = st.empty()
-            results = []
-
-            for i in range(nvar):
-                status.text("Generating " + str(i + 1) + " of " + str(nvar))
-                try:
-                    chosen_hook = random.choice(hk)
-                    chosen_av = random.choice(av)
-                    chosen_bg = random.choice(bg)
-                    hn = chosen_hook[0]
-                    hp = chosen_hook[1]
-                    an = chosen_av[0]
-                    ap = chosen_av[1]
-                    bn = chosen_bg[0]
-                    bp = chosen_bg[1]
-
-                    suffix1 = uuid.uuid4().hex[:6]
-                    suffix2 = uuid.uuid4().hex[:6]
-                    main_path = os.path.join(tmpdir, "main_" + suffix1 + ".mp4")
-                    final_path = os.path.join(tmpdir, "final_" + str(i + 1) + "_" + suffix2 + ".mp4")
-
-                    nc = composite_avatar(bp, ap, w, h, main_path, mp_v, db_v, fmin_v, fmax_v)
-                    concat_videos([hp, main_path], w, h, final_path, tmpdir)
-
-                    results.append((i + 1, final_path, hn, an, bn, nc))
-                except Exception as e:
-                    st.error("Variation " + str(i + 1) + " failed: " + str(e)[:300])
-                prog.progress((i + 1) / nvar)
-
-            status.text("Done. " + str(len(results)) + " variations generated.")
-
-            for r in results:
-                idx = r[0]
-                path = r[1]
-                hn = r[2]
-                an = r[3]
-                bn = r[4]
-                nc = r[5]
-                with st.expander("Variation " + str(idx) + " (" + str(nc) + " cuts)", expanded=(idx == 1)):
-                    st.caption("Hook: " + hn + " | Avatar: " + an + " | Background: " + bn)
-                    with open(path, "rb") as f:
-                        data = f.read()
-                    st.video(data)
-                    st.download_button("Download Variation " + str(idx), data,
-                                       file_name="variation_" + str(idx) + ".mp4",
-                                       mime="video/mp4", key="vgdl_" + str(idx))
+        # Show results
+        for r in results:
+            idx = r[0]
+            path = r[1]
+            hn = r[2]
+            bn = r[3]
+            an = r[4]
+            nc = r[5]
+            label = "Variation " + str(idx) + " (" + str(nc) + " avatar cuts)"
+            with st.expander(label, expanded=(idx == 1)):
+                st.caption("Hook: " + hn + " | Background: " + bn + " | HeyGen: " + an)
+                with open(path, "rb") as f:
+                    data = f.read()
+                st.video(data)
+                st.download_button(
+                    "Download Variation " + str(idx),
+                    data,
+                    file_name="variation_" + str(idx) + ".mp4",
+                    mime="video/mp4",
+                    key="dl_" + str(idx)
+                )
