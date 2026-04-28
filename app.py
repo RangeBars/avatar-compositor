@@ -57,57 +57,44 @@ def detect_silence_cuts(audio_path, min_silence=0.25, silence_db=-30):
     return cuts
 
 
-def fit_background_to_avatar(bg_path, avatar_path, w, h, tmpdir):
-    """Loop or trim background to exactly match avatar duration. Re-encode at target size."""
-    target_dur = get_duration(avatar_path)
-    bg_dur = get_duration(bg_path)
-    
-    suffix = uuid.uuid4().hex[:6]
-    out = os.path.join(tmpdir, "bgfit_" + suffix + ".mp4")
-    
-    # Always re-encode at the target canvas size (also handles aspect ratio properly)
-    scale_filter = (
-        "scale=" + str(w) + ":" + str(h) +
-        ":force_original_aspect_ratio=increase:flags=lanczos,crop=" +
-        str(w) + ":" + str(h) + ",setsar=1,fps=30"
-    )
-    
-    if bg_dur < target_dur - 0.5:
-        # Loop to cover target duration
-        cmd = [
-            "ffmpeg", "-y",
-            "-stream_loop", "-1", "-i", bg_path,
-            "-t", ("%.2f" % target_dur),
-            "-vf", scale_filter,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-            "-c:a", "aac", "-b:a", "128k",
-            out
-        ]
-    else:
-        # Trim to target duration (or just re-encode if equal)
-        cmd = [
-            "ffmpeg", "-y", "-i", bg_path,
-            "-t", ("%.2f" % target_dur),
-            "-vf", scale_filter,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-            "-c:a", "aac", "-b:a", "128k",
-            out
-        ]
-    
+def concat_videos(paths, w, h, output_path, tmpdir):
+    normalized = []
+    for p in paths:
+        if not has_audio(p):
+            p = add_silent_audio(p, tmpdir)
+        normalized.append(p)
+
+    n = len(normalized)
+    inputs = []
+    for p in normalized:
+        inputs.extend(["-i", p])
+
+    parts = []
+    concat_str = ""
+    scale_str = "scale=" + str(w) + ":" + str(h) + ":force_original_aspect_ratio=decrease,pad=" + str(w) + ":" + str(h) + ":(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30"
+    for i in range(n):
+        idx = str(i)
+        parts.append("[" + idx + ":v]" + scale_str + "[v" + idx + "]")
+        concat_str += "[v" + idx + "][" + idx + ":a]"
+    parts.append(concat_str + "concat=n=" + str(n) + ":v=1:a=1[outv][outa]")
+    full_filter = ";".join(parts)
+
+    cmd = ["ffmpeg", "-y"] + inputs + [
+        "-filter_complex", full_filter,
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        output_path
+    ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError("Background fit failed: " + result.stderr[-1000:])
-    return out
+        raise RuntimeError(result.stderr[-1500:])
 
 
-def composite_avatar(bg_fitted_path, avatar_path, w, h, output_path,
+def composite_avatar(bg_path, avatar_path, w, h, output_path,
                      key_color, key_tolerance, key_softness,
                      bg_audio_volume,
                      min_pause=0.25, silence_db=-30, fb_min=2.0, fb_max=3.5):
-    """
-    Composite avatar over already-fitted background.
-    bg_fitted_path: background already looped/trimmed to avatar length and at target size
-    """
     duration = get_duration(avatar_path)
     pauses = detect_silence_cuts(avatar_path, min_pause, silence_db)
 
@@ -169,32 +156,31 @@ def composite_avatar(bg_fitted_path, avatar_path, w, h, output_path,
         segments = [(0, duration, int(w * zone[0]), int(h * zone[1]), zone[2])]
 
     n_segs = len(segments)
-    
-    # Filter chain
+
     parts = []
-    
-    # Background already fitted, just ensure SAR
-    parts.append("[0:v]setsar=1,fps=30[bg]")
-    
-    # Key the avatar then split into N copies
+    # Background scaled to canvas. -stream_loop on input handles looping if shorter than avatar.
     parts.append(
-        "[1:v]colorkey=" + key_color + ":" +
-        ("%.2f" % key_tolerance) + ":" +
-        ("%.2f" % key_softness) + ",format=yuva420p[keyed]"
+        "[0:v]scale=" + str(w) + ":" + str(h) +
+        ":force_original_aspect_ratio=increase,crop=" + str(w) + ":" + str(h) +
+        ",setsar=1,fps=30[bg]"
     )
-    
+    parts.append(
+        "[1:v]colorkey=" + key_color + ":" + ("%.2f" % key_tolerance) + ":" + ("%.2f" % key_softness) +
+        ",format=yuva420p[keyed]"
+    )
+
     split_outputs = ""
     for i in range(n_segs):
         split_outputs += "[k" + str(i) + "]"
     parts.append("[keyed]split=" + str(n_segs) + split_outputs)
-    
+
     for i in range(n_segs):
         seg = segments[i]
         scale = seg[4]
         sw = int(w * scale)
         idx = str(i)
-        parts.append("[k" + idx + "]scale=" + str(sw) + ":-2:flags=lanczos[s" + idx + "]")
-    
+        parts.append("[k" + idx + "]scale=" + str(sw) + ":-2[s" + idx + "]")
+
     chain_input = "[bg]"
     for i in range(n_segs):
         seg = segments[i]
@@ -215,85 +201,43 @@ def composite_avatar(bg_fitted_path, avatar_path, w, h, output_path,
             ":" + enable_str + out_label
         )
         chain_input = "[v" + idx + "]"
-    
-    # Audio handling
+
+    # Audio
     if bg_audio_volume > 0:
-        if not has_audio(bg_fitted_path):
-            bg_fitted_path = add_silent_audio(bg_fitted_path, os.path.dirname(output_path))
-        parts.append(
-            "[0:a]volume=" + ("%.2f" % bg_audio_volume) + "[bga]"
-        )
+        parts.append("[0:a]volume=" + ("%.2f" % bg_audio_volume) + "[bga]")
         parts.append("[1:a]volume=1.0[ava]")
-        parts.append(
-            "[bga][ava]amix=inputs=2:duration=shortest:dropout_transition=0[outa]"
-        )
+        parts.append("[bga][ava]amix=inputs=2:duration=first:dropout_transition=0[outa]")
         audio_map = "[outa]"
     else:
         audio_map = "1:a?"
-    
+
     full_filter = ";".join(parts)
 
+    # Make sure background has audio if we're mixing
+    bg_for_input = bg_path
+    if bg_audio_volume > 0 and not has_audio(bg_path):
+        bg_for_input = add_silent_audio(bg_path, os.path.dirname(output_path))
+
+    # KEY PART: -stream_loop -1 on the background causes it to loop seamlessly
+    # if shorter than the avatar. -t locks output to avatar duration.
     cmd = [
         "ffmpeg", "-y",
-        "-i", bg_fitted_path,
+        "-stream_loop", "-1", "-i", bg_for_input,
         "-i", avatar_path,
         "-filter_complex", full_filter,
         "-map", "[outv]",
         "-map", audio_map,
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+        "-t", ("%.2f" % duration),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
         "-c:a", "aac", "-b:a", "128k",
         "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        "-t", ("%.2f" % duration),
         output_path
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError("Composite failed: " + result.stderr[-1500:])
+        raise RuntimeError(result.stderr[-2000:])
 
     return n_segs
-
-
-def concat_videos(paths, w, h, output_path, tmpdir):
-    """Concatenate videos by re-encoding to ensure compatibility. Uses ultrafast preset."""
-    normalized = []
-    for p in paths:
-        if not has_audio(p):
-            p = add_silent_audio(p, tmpdir)
-        normalized.append(p)
-
-    n = len(normalized)
-    inputs = []
-    for p in normalized:
-        inputs.extend(["-i", p])
-
-    parts = []
-    concat_str = ""
-    scale_str = (
-        "scale=" + str(w) + ":" + str(h) +
-        ":force_original_aspect_ratio=decrease:flags=lanczos,pad=" +
-        str(w) + ":" + str(h) +
-        ":(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30"
-    )
-    for i in range(n):
-        idx = str(i)
-        parts.append("[" + idx + ":v]" + scale_str + "[v" + idx + "]")
-        concat_str += "[v" + idx + "][" + idx + ":a]"
-    parts.append(concat_str + "concat=n=" + str(n) + ":v=1:a=1[outv][outa]")
-    full_filter = ";".join(parts)
-
-    cmd = ["ffmpeg", "-y"] + inputs + [
-        "-filter_complex", full_filter,
-        "-map", "[outv]", "-map", "[outa]",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-        "-c:a", "aac", "-b:a", "128k",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError("Concat failed: " + result.stderr[-1500:])
 
 
 def parse_size(s):
@@ -347,23 +291,15 @@ else:
 st.markdown("**Avatar background removal**")
 key_mode = st.radio(
     "What background did you use in HeyGen?",
-    ["Green screen (#00FF00) - RECOMMENDED", "White / no background", "Custom color"],
+    ["Green screen (#00FF00)", "White / no background"],
     key="keymode"
 )
 
-if key_mode == "Custom color":
-    custom_hex = st.text_input("Hex color to remove", value="0x00FF00", key="customhex")
-
-key_tolerance = st.slider(
-    "Keying tolerance (higher = removes more)", 0.10, 0.50, 0.30, 0.05, key="ktol"
-)
+key_tolerance = st.slider("Keying tolerance", 0.10, 0.50, 0.30, 0.05, key="ktol")
 key_softness = st.slider("Edge softness", 0.0, 0.50, 0.15, 0.05, key="ksoft")
+bg_audio_volume = st.slider("Background video audio volume", 0.0, 1.0, 0.30, 0.05, key="bgvol")
 
-bg_audio_volume = st.slider(
-    "Background video audio volume", 0.0, 1.0, 0.30, 0.05, key="bgvol"
-)
-
-with st.expander("Advanced cut settings (avatar movement)"):
+with st.expander("Advanced cut settings"):
     min_pause = st.slider("Minimum pause for cut (seconds)", 0.10, 1.0, 0.25, 0.05, key="minpause")
     silence_db = st.slider("Silence threshold (dB)", -50, -15, -30, 1, key="db")
     fb_min = st.slider("Fallback minimum cut (seconds)", 1.0, 5.0, 2.0, 0.5, key="fmin")
@@ -374,8 +310,7 @@ if hook_files and bg_files and heygen_files:
     st.info(
         "You have " + str(len(hook_files)) + " hooks, " +
         str(len(bg_files)) + " backgrounds, and " +
-        str(len(heygen_files)) + " HeyGen videos. " +
-        "Total possible combinations: " + str(total_combos)
+        str(len(heygen_files)) + " HeyGen videos. Total possible combinations: " + str(total_combos)
     )
 
 
@@ -396,12 +331,8 @@ if st.button("ACTIVATE — Generate Videos", type="primary", key="activate"):
 
         if key_mode.startswith("Green"):
             key_color = "0x00FF00"
-        elif key_mode.startswith("White"):
-            key_color = "0xFFFFFF"
         else:
-            key_color = custom_hex.strip()
-            if not key_color.startswith("0x"):
-                key_color = "0x" + key_color.lstrip("#").lstrip("0x")
+            key_color = "0xFFFFFF"
 
         with st.spinner("Saving uploads..."):
             hook_list = []
@@ -414,20 +345,6 @@ if st.button("ACTIVATE — Generate Videos", type="primary", key="activate"):
             heygen_list = []
             for f in heygen_files:
                 heygen_list.append((f.name, save_upload(f, tmpdir, "hg")))
-
-        # Pre-fit each (background, avatar) pair so backgrounds match avatar lengths
-        # Cache: key is (bg_path, avatar_path), value is fitted_bg_path
-        fit_cache = {}
-        with st.spinner("Pre-fitting backgrounds to avatar lengths..."):
-            for hg_name, hg_path in heygen_list:
-                for bg_name, bg_path in bg_list:
-                    cache_key = (bg_path, hg_path)
-                    try:
-                        fitted = fit_background_to_avatar(bg_path, hg_path, w, h, tmpdir)
-                        fit_cache[cache_key] = fitted
-                    except Exception as e:
-                        st.warning("Could not pre-fit " + bg_name + " for " + hg_name + ": " + str(e)[:200])
-                        fit_cache[cache_key] = None
 
         all_combos = list(itertools.product(hook_list, bg_list, heygen_list))
 
@@ -462,12 +379,6 @@ if st.button("ACTIVATE — Generate Videos", type="primary", key="activate"):
             bg_path = bg_pair[1]
             hg_name = hg_pair[0]
             hg_path = hg_pair[1]
-            
-            fitted_bg = fit_cache.get((bg_path, hg_path))
-            if fitted_bg is None:
-                st.error("Variation " + str(i + 1) + " skipped: background prep failed")
-                prog.progress((i + 1) / len(combos_to_make))
-                continue
 
             status.text("Generating " + str(i + 1) + " of " + str(len(combos_to_make)))
 
@@ -475,7 +386,7 @@ if st.button("ACTIVATE — Generate Videos", type="primary", key="activate"):
                 suffix1 = uuid.uuid4().hex[:6]
                 main_path = os.path.join(tmpdir, "main_" + suffix1 + ".mp4")
                 num_cuts = composite_avatar(
-                    fitted_bg, hg_path, w, h, main_path,
+                    bg_path, hg_path, w, h, main_path,
                     key_color, key_tolerance, key_softness, bg_audio_volume,
                     min_pause, silence_db, fb_min, fb_max
                 )
