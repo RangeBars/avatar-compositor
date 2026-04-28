@@ -16,7 +16,8 @@ tab1, tab2, tab3 = st.tabs(["Hook Builder", "Background Generator", "Variation G
 # ============== HELPERS ==============
 
 def save_upload(file, tmpdir, prefix):
-    path = os.path.join(tmpdir, prefix + "_" + uuid.uuid4().hex[:6] + ".mp4")
+    suffix = uuid.uuid4().hex[:6]
+    path = os.path.join(tmpdir, prefix + "_" + suffix + ".mp4")
     with open(path, "wb") as f:
         f.write(file.read())
     return path
@@ -36,7 +37,8 @@ def has_audio(path):
 
 
 def add_silent_audio(path, tmpdir):
-    out = os.path.join(tmpdir, "silent_" + uuid.uuid4().hex[:6] + ".mp4")
+    suffix = uuid.uuid4().hex[:6]
+    out = os.path.join(tmpdir, "silent_" + suffix + ".mp4")
     cmd = ["ffmpeg", "-y", "-i", path,
            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
            "-c:v", "copy", "-c:a", "aac", "-shortest", out]
@@ -45,9 +47,8 @@ def add_silent_audio(path, tmpdir):
 
 
 def detect_silence_cuts(audio_path, min_silence=0.25, silence_db=-30):
-    cmd = ["ffmpeg", "-i", audio_path,
-           "-af", "silencedetect=noise=" + str(silence_db) + "dB:d=" + str(min_silence),
-           "-f", "null", "-"]
+    af_arg = "silencedetect=noise=" + str(silence_db) + "dB:d=" + str(min_silence)
+    cmd = ["ffmpeg", "-i", audio_path, "-af", af_arg, "-f", "null", "-"]
     result = subprocess.run(cmd, capture_output=True, text=True)
     cuts = []
     for line in result.stderr.split("\n"):
@@ -71,9 +72,11 @@ def concat_videos(paths, w, h, output_path, tmpdir):
 
     parts = []
     concat_str = ""
+    scale_str = "scale=" + str(w) + ":" + str(h) + ",setsar=1,fps=30"
     for i in range(n):
-        parts.append("[" + str(i) + ":v]scale=" + str(w) + ":" + str(h) + ",setsar=1,fps=30[v" + str(i) + "]")
-        concat_str += "[v" + str(i) + "][" + str(i) + ":a]"
+        idx = str(i)
+        parts.append("[" + idx + ":v]" + scale_str + "[v" + idx + "]")
+        concat_str += "[v" + idx + "][" + idx + ":a]"
     parts.append(concat_str + "concat=n=" + str(n) + ":v=1:a=1[outv][outa]")
     full_filter = ";".join(parts)
 
@@ -145,19 +148,27 @@ def composite_avatar(bg_path, avatar_path, w, h, output_path, min_pause=0.25, si
         zone = random.choice(zones)
         segments = [(0, duration, int(w * zone[0]), int(h * zone[1]), zone[2])]
 
-    parts = [
-        "[0:v]scale=" + str(w) + ":" + str(h) + ",setsar=1[bg]",
-        "[1:v]colorkey=0x00FF00:0.30:0.15[keyed]"
-    ]
+    parts = []
+    parts.append("[0:v]scale=" + str(w) + ":" + str(h) + ",setsar=1[bg]")
+    parts.append("[1:v]colorkey=0x00FF00:0.30:0.15[keyed]")
+
     chain = "[bg]"
-    for i, (start, end, x, y, scale) in enumerate(segments):
+    for i, seg in enumerate(segments):
+        start, end, x, y, scale = seg
+        idx = str(i)
         sw = int(w * scale)
-        parts.append("[keyed]scale=" + str(sw) + ":-1[s" + str(i) + "]")
-        next_label = "[v" + str(i) + "]" if i < len(segments) - 1 else "[outv]"
-        chain += "[s" + str(i) + "]overlay=" + str(x) + ":" + str(y) + ":enable='between(t," + ("%.2f" % start) + "," + ("%.2f" % end) + ")'" + next_label
+        parts.append("[keyed]scale=" + str(sw) + ":-1[s" + idx + "]")
+        if i < len(segments) - 1:
+            next_label = "[v" + idx + "]"
+        else:
+            next_label = "[outv]"
+        start_str = ("%.2f" % start)
+        end_str = ("%.2f" % end)
+        enable_str = "enable='between(t," + start_str + "," + end_str + ")'"
+        chain += "[s" + idx + "]overlay=" + str(x) + ":" + str(y) + ":" + enable_str + next_label
         if i < len(segments) - 1:
             parts.append(chain)
-            chain = "[v" + str(i) + "]"
+            chain = "[v" + idx + "]"
     parts.append(chain)
     full_filter = ";".join(parts)
 
@@ -206,7 +217,9 @@ with tab1:
             w, h = parse_size(size1)
 
             with st.spinner("Saving uploads..."):
-                a_paths = [(f.name, save_upload(f, tmpdir, "a")) for f in a_files]
+                a_paths = []
+                for f in a_files:
+                    a_paths.append((f.name, save_upload(f, tmpdir, "a")))
                 b_path = save_upload(b_file, tmpdir, "b")
 
             st.info("Building " + str(len(a_paths)) + " hooks...")
@@ -214,10 +227,13 @@ with tab1:
             status = st.empty()
             results = []
 
-            for i, (an, ap) in enumerate(a_paths):
+            for i in range(len(a_paths)):
+                an = a_paths[i][0]
+                ap = a_paths[i][1]
                 status.text("Building " + str(i + 1) + " of " + str(len(a_paths)) + ": B + " + an)
                 try:
-                    out_path = os.path.join(tmpdir, "hook_" + str(i + 1) + "_" + uuid.uuid4().hex[:6] + ".mp4")
+                    suffix = uuid.uuid4().hex[:6]
+                    out_path = os.path.join(tmpdir, "hook_" + str(i + 1) + "_" + suffix + ".mp4")
                     concat_videos([b_path, ap], w, h, out_path, tmpdir)
                     results.append((i + 1, out_path, an))
                 except Exception as e:
@@ -226,7 +242,10 @@ with tab1:
 
             status.text("Done. " + str(len(results)) + " hooks built.")
 
-            for idx, path, an in results:
+            for r in results:
+                idx = r[0]
+                path = r[1]
+                an = r[2]
                 with st.expander("Hook " + str(idx) + ": B + " + an, expanded=(idx == 1)):
                     with open(path, "rb") as f:
                         data = f.read()
@@ -244,8 +263,8 @@ with tab2:
 
     bg_lib = st.file_uploader("Background clips", type=["mp4", "mov"], accept_multiple_files=True, key="bglib")
 
-    n_clips = len(bg_lib) if bg_lib else 0
     if bg_lib:
+        n_clips = len(bg_lib)
         total_perms = factorial(n_clips)
         st.info("With " + str(n_clips) + " clips, there are " + str(total_perms) + " possible orderings.")
 
@@ -260,7 +279,9 @@ with tab2:
             w, h = parse_size(size2)
 
             with st.spinner("Saving uploads..."):
-                lib = [(f.name, save_upload(f, tmpdir, "lib")) for f in bg_lib]
+                lib = []
+                for f in bg_lib:
+                    lib.append((f.name, save_upload(f, tmpdir, "lib")))
 
             all_perms = list(itertools.permutations(lib))
             if len(all_perms) > max_output:
@@ -271,12 +292,17 @@ with tab2:
             status = st.empty()
             results = []
 
-            for v, perm in enumerate(all_perms):
-                names = [p[0] for p in perm]
-                paths = [p[1] for p in perm]
+            for v in range(len(all_perms)):
+                perm = all_perms[v]
+                names = []
+                paths = []
+                for p in perm:
+                    names.append(p[0])
+                    paths.append(p[1])
                 status.text("Generating " + str(v + 1) + " of " + str(len(all_perms)) + ": " + " > ".join(names))
                 try:
-                    out_path = os.path.join(tmpdir, "bg_" + str(v + 1) + "_" + uuid.uuid4().hex[:6] + ".mp4")
+                    suffix = uuid.uuid4().hex[:6]
+                    out_path = os.path.join(tmpdir, "bg_" + str(v + 1) + "_" + suffix + ".mp4")
                     concat_videos(paths, w, h, out_path, tmpdir)
                     results.append((v + 1, out_path, names))
                 except Exception as e:
@@ -285,7 +311,10 @@ with tab2:
 
             status.text("Done. " + str(len(results)) + " backgrounds generated.")
 
-            for idx, path, names in results:
+            for r in results:
+                idx = r[0]
+                path = r[1]
+                names = r[2]
                 with st.expander("Background " + str(idx) + ": " + " > ".join(names), expanded=(idx == 1)):
                     with open(path, "rb") as f:
                         data = f.read()
@@ -323,9 +352,15 @@ with tab3:
             w, h = parse_size(size3)
 
             with st.spinner("Saving uploads..."):
-                hk = [(f.name, save_upload(f, tmpdir, "hk")) for f in hooks]
-                av = [(f.name, save_upload(f, tmpdir, "av")) for f in avs]
-                bg = [(f.name, save_upload(f, tmpdir, "bg")) for f in bgs]
+                hk = []
+                for f in hooks:
+                    hk.append((f.name, save_upload(f, tmpdir, "hk")))
+                av = []
+                for f in avs:
+                    av.append((f.name, save_upload(f, tmpdir, "av")))
+                bg = []
+                for f in bgs:
+                    bg.append((f.name, save_upload(f, tmpdir, "bg")))
 
             prog = st.progress(0)
             status = st.empty()
@@ -334,12 +369,20 @@ with tab3:
             for i in range(nvar):
                 status.text("Generating " + str(i + 1) + " of " + str(nvar))
                 try:
-                    hn, hp = random.choice(hk)
-                    an, ap = random.choice(av)
-                    bn, bp = random.choice(bg)
+                    chosen_hook = random.choice(hk)
+                    chosen_av = random.choice(av)
+                    chosen_bg = random.choice(bg)
+                    hn = chosen_hook[0]
+                    hp = chosen_hook[1]
+                    an = chosen_av[0]
+                    ap = chosen_av[1]
+                    bn = chosen_bg[0]
+                    bp = chosen_bg[1]
 
-                    main_path = os.path.join(tmpdir, "main_" + uuid.uuid4().hex[:6] + ".mp4")
-                    final_path = os.path.join(tmpdir, "final_" + str(i + 1) + "_" + uuid.uuid4().hex[:6] + ".mp4")
+                    suffix1 = uuid.uuid4().hex[:6]
+                    suffix2 = uuid.uuid4().hex[:6]
+                    main_path = os.path.join(tmpdir, "main_" + suffix1 + ".mp4")
+                    final_path = os.path.join(tmpdir, "final_" + str(i + 1) + "_" + suffix2 + ".mp4")
 
                     nc = composite_avatar(bp, ap, w, h, main_path, mp_v, db_v, fmin_v, fmax_v)
                     concat_videos([hp, main_path], w, h, final_path, tmpdir)
@@ -351,7 +394,13 @@ with tab3:
 
             status.text("Done. " + str(len(results)) + " variations generated.")
 
-            for idx, path, hn, an, bn, nc in results:
+            for r in results:
+                idx = r[0]
+                path = r[1]
+                hn = r[2]
+                an = r[3]
+                bn = r[4]
+                nc = r[5]
                 with st.expander("Variation " + str(idx) + " (" + str(nc) + " cuts)", expanded=(idx == 1)):
                     st.caption("Hook: " + hn + " | Avatar: " + an + " | Background: " + bn)
                     with open(path, "rb") as f:
