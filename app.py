@@ -5,6 +5,7 @@ import os
 import tempfile
 import uuid
 import re
+import itertools
 
 st.set_page_config(page_title="Avatar Video Toolkit", layout="centered")
 st.title("Avatar Video Toolkit")
@@ -22,58 +23,31 @@ def save_upload(file, tmpdir, prefix):
 
 
 def get_duration(path):
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path
-    ]
-    out = subprocess.check_output(cmd).strip()
-    return float(out)
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+           "-of", "default=noprint_wrappers=1:nokey=1", path]
+    return float(subprocess.check_output(cmd).strip())
 
 
 def has_audio(path):
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "a",
-        "-show_entries", "stream=codec_type",
-        "-of", "csv=p=0", path
-    ]
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "a",
+           "-show_entries", "stream=codec_type", "-of", "csv=p=0", path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     return "audio" in result.stdout
 
 
 def add_silent_audio(path, tmpdir):
     out = os.path.join(tmpdir, "silent_" + uuid.uuid4().hex[:6] + ".mp4")
-    cmd = [
-        "ffmpeg", "-y", "-i", path,
-        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-        "-c:v", "copy", "-c:a", "aac", "-shortest", out
-    ]
-    subprocess.run(cmd, capture_output=True, check=True)
-    return out
-
-
-def trim_video(path, max_seconds, tmpdir):
-    dur = get_duration(path)
-    if dur <= max_seconds:
-        return path
-    out = os.path.join(tmpdir, "trim_" + uuid.uuid4().hex[:6] + ".mp4")
-    cmd = [
-        "ffmpeg", "-y", "-i", path, "-t", str(max_seconds),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-        "-c:a", "aac", out
-    ]
+    cmd = ["ffmpeg", "-y", "-i", path,
+           "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+           "-c:v", "copy", "-c:a", "aac", "-shortest", out]
     subprocess.run(cmd, capture_output=True, check=True)
     return out
 
 
 def detect_silence_cuts(audio_path, min_silence=0.25, silence_db=-30):
-    cmd = [
-        "ffmpeg", "-i", audio_path,
-        "-af", "silencedetect=noise=" + str(silence_db) + "dB:d=" + str(min_silence),
-        "-f", "null", "-"
-    ]
+    cmd = ["ffmpeg", "-i", audio_path,
+           "-af", "silencedetect=noise=" + str(silence_db) + "dB:d=" + str(min_silence),
+           "-f", "null", "-"]
     result = subprocess.run(cmd, capture_output=True, text=True)
     cuts = []
     for line in result.stderr.split("\n"):
@@ -83,7 +57,7 @@ def detect_silence_cuts(audio_path, min_silence=0.25, silence_db=-30):
     return cuts
 
 
-def concat_videos(paths, w, h, output_path, tmpdir, crossfade=0):
+def concat_videos(paths, w, h, output_path, tmpdir):
     normalized = []
     for p in paths:
         if not has_audio(p):
@@ -95,36 +69,13 @@ def concat_videos(paths, w, h, output_path, tmpdir, crossfade=0):
     for p in normalized:
         inputs.extend(["-i", p])
 
-    if crossfade <= 0 or n == 1:
-        parts = []
-        concat_str = ""
-        for i in range(n):
-            parts.append("[" + str(i) + ":v]scale=" + str(w) + ":" + str(h) + ",setsar=1,fps=30[v" + str(i) + "]")
-            concat_str += "[v" + str(i) + "][" + str(i) + ":a]"
-        parts.append(concat_str + "concat=n=" + str(n) + ":v=1:a=1[outv][outa]")
-        full_filter = ";".join(parts)
-    else:
-        durations = [get_duration(p) for p in normalized]
-        parts = []
-        for i in range(n):
-            parts.append("[" + str(i) + ":v]scale=" + str(w) + ":" + str(h) + ",setsar=1,fps=30[v" + str(i) + "]")
-        prev_v = "v0"
-        prev_a = "0:a"
-        offset = durations[0] - crossfade
-        for i in range(1, n):
-            out_v = "vx" + str(i) if i < n - 1 else "outv"
-            out_a = "ax" + str(i) if i < n - 1 else "outa"
-            parts.append(
-                "[" + prev_v + "][v" + str(i) + "]xfade=transition=fade:duration=" +
-                str(crossfade) + ":offset=" + ("%.2f" % offset) + "[" + out_v + "]"
-            )
-            parts.append(
-                "[" + prev_a + "][" + str(i) + ":a]acrossfade=d=" + str(crossfade) + "[" + out_a + "]"
-            )
-            prev_v = out_v
-            prev_a = out_a
-            offset += durations[i] - crossfade
-        full_filter = ";".join(parts)
+    parts = []
+    concat_str = ""
+    for i in range(n):
+        parts.append("[" + str(i) + ":v]scale=" + str(w) + ":" + str(h) + ",setsar=1,fps=30[v" + str(i) + "]")
+        concat_str += "[v" + str(i) + "][" + str(i) + ":a]"
+    parts.append(concat_str + "concat=n=" + str(n) + ":v=1:a=1[outv][outa]")
+    full_filter = ";".join(parts)
 
     cmd = ["ffmpeg", "-y"] + inputs + [
         "-filter_complex", full_filter,
@@ -229,151 +180,132 @@ def parse_size(s):
     return int(nums[0]), int(nums[1])
 
 
+def factorial(n):
+    result = 1
+    for i in range(2, n + 1):
+        result *= i
+    return result
+
+
 # ============== TAB 1: HOOK BUILDER ==============
 
 with tab1:
     st.header("Hook Builder")
-    st.write("Combine Video A + Video B into finished hooks. Bulk mode supported.")
+    st.write("Upload many Video A's and one Video B. Each output: Video B then Video A.")
 
-    a_files = st.file_uploader("Video A files (openers)", type=["mp4", "mov"], accept_multiple_files=True, key="a")
-    b_files = st.file_uploader("Video B files (end scenes)", type=["mp4", "mov"], accept_multiple_files=True, key="b")
-
-    mode = st.radio("Pairing mode", ["Every combination (A x B)", "Random pairings"], key="hbmode")
-    n_random = 10
-    if mode == "Random pairings":
-        n_random = st.slider("How many random hooks?", 1, 50, 10, key="hbnum")
+    a_files = st.file_uploader("Video A files (upload many variations)", type=["mp4", "mov"], accept_multiple_files=True, key="a")
+    b_file = st.file_uploader("Video B (upload one - plays first)", type=["mp4", "mov"], key="b")
 
     size1 = st.selectbox("Output size", ["1080x1920 (vertical)", "1920x1080 (horizontal)", "1080x1080 (square)"], key="hbsize")
-    xfade1 = st.checkbox("Crossfade between A and B (0.3s)", value=False, key="hbxf")
 
     if st.button("Build Hooks", type="primary", key="hbbtn"):
-        if not a_files or not b_files:
-            st.error("Upload at least one A and one B.")
+        if not a_files or not b_file:
+            st.error("Upload at least one Video A and one Video B.")
         else:
             tmpdir = tempfile.gettempdir()
             w, h = parse_size(size1)
 
             with st.spinner("Saving uploads..."):
                 a_paths = [(f.name, save_upload(f, tmpdir, "a")) for f in a_files]
-                b_paths = [(f.name, save_upload(f, tmpdir, "b")) for f in b_files]
+                b_path = save_upload(b_file, tmpdir, "b")
 
-            if mode == "Every combination (A x B)":
-                pairs = [(a, b) for a in a_paths for b in b_paths]
-            else:
-                pairs = [(random.choice(a_paths), random.choice(b_paths)) for _ in range(n_random)]
-
-            st.info("Building " + str(len(pairs)) + " hooks...")
+            st.info("Building " + str(len(a_paths)) + " hooks...")
             prog = st.progress(0)
             status = st.empty()
             results = []
 
-            for i, ((an, ap), (bn, bp)) in enumerate(pairs):
-                status.text("Building " + str(i + 1) + " of " + str(len(pairs)))
+            for i, (an, ap) in enumerate(a_paths):
+                status.text("Building " + str(i + 1) + " of " + str(len(a_paths)) + ": B + " + an)
                 try:
                     out_path = os.path.join(tmpdir, "hook_" + str(i + 1) + "_" + uuid.uuid4().hex[:6] + ".mp4")
-                    cf = 0.3 if xfade1 else 0
-                    concat_videos([ap, bp], w, h, out_path, tmpdir, crossfade=cf)
-                    results.append((i + 1, out_path, an, bn))
+                    concat_videos([b_path, ap], w, h, out_path, tmpdir)
+                    results.append((i + 1, out_path, an))
                 except Exception as e:
                     st.error("Hook " + str(i + 1) + " failed: " + str(e)[:300])
-                prog.progress((i + 1) / len(pairs))
+                prog.progress((i + 1) / len(a_paths))
 
             status.text("Done. " + str(len(results)) + " hooks built.")
 
-            for idx, path, an, bn in results:
-                with st.expander("Hook " + str(idx) + ": " + an + " + " + bn, expanded=(idx == 1)):
+            for idx, path, an in results:
+                with st.expander("Hook " + str(idx) + ": B + " + an, expanded=(idx == 1)):
                     with open(path, "rb") as f:
                         data = f.read()
                     st.video(data)
-                    st.download_button("Download Hook " + str(idx), data, file_name="hook_" + str(idx) + ".mp4", mime="video/mp4", key="hbdl_" + str(idx))
+                    st.download_button("Download Hook " + str(idx), data,
+                                       file_name="hook_" + str(idx) + ".mp4",
+                                       mime="video/mp4", key="hbdl_" + str(idx))
 
 
 # ============== TAB 2: BACKGROUND GENERATOR ==============
 
 with tab2:
     st.header("Background Generator")
-    st.write("Stitch random clips from a library into unique backgrounds.")
+    st.write("Upload background clips. Generates every possible order (permutation), capped by your max.")
 
-    bg_lib = st.file_uploader("Background clip library", type=["mp4", "mov"], accept_multiple_files=True, key="bglib")
+    bg_lib = st.file_uploader("Background clips", type=["mp4", "mov"], accept_multiple_files=True, key="bglib")
 
-    target = st.slider("Target length (seconds)", 15, 180, 60, 5, key="bgtarget")
-    cmin = st.slider("Shortest segment (seconds)", 1.0, 10.0, 3.0, 0.5, key="bgcmin")
-    cmax = st.slider("Longest segment (seconds)", 2.0, 15.0, 6.0, 0.5, key="bgcmax")
-    bgnum = st.slider("How many backgrounds?", 1, 10, 1, key="bgnum")
-    xfade2 = st.checkbox("Crossfade between clips (0.3s)", value=True, key="bgxf")
+    n_clips = len(bg_lib) if bg_lib else 0
+    if bg_lib:
+        total_perms = factorial(n_clips)
+        st.info("With " + str(n_clips) + " clips, there are " + str(total_perms) + " possible orderings.")
+
+    max_output = st.slider("Max number of variations to generate", 1, 50, 10, key="bgmax")
     size2 = st.selectbox("Output size", ["1080x1920 (vertical)", "1920x1080 (horizontal)", "1080x1080 (square)"], key="bgsize")
-    repeat = st.checkbox("Allow repeats in one background", value=False, key="bgrep")
 
     if st.button("Generate Backgrounds", type="primary", key="bgbtn"):
-        if not bg_lib:
-            st.error("Upload at least one clip.")
+        if not bg_lib or len(bg_lib) < 2:
+            st.error("Upload at least 2 clips.")
         else:
             tmpdir = tempfile.gettempdir()
             w, h = parse_size(size2)
 
             with st.spinner("Saving uploads..."):
-                lib = [save_upload(f, tmpdir, "lib") for f in bg_lib]
+                lib = [(f.name, save_upload(f, tmpdir, "lib")) for f in bg_lib]
 
+            all_perms = list(itertools.permutations(lib))
+            if len(all_perms) > max_output:
+                all_perms = random.sample(all_perms, max_output)
+
+            st.info("Generating " + str(len(all_perms)) + " variations...")
             prog = st.progress(0)
             status = st.empty()
             results = []
 
-            for v in range(bgnum):
-                status.text("Generating background " + str(v + 1) + " of " + str(bgnum))
+            for v, perm in enumerate(all_perms):
+                names = [p[0] for p in perm]
+                paths = [p[1] for p in perm]
+                status.text("Generating " + str(v + 1) + " of " + str(len(all_perms)) + ": " + " > ".join(names))
                 try:
-                    selected = []
-                    used = set()
-                    accum = 0.0
-
-                    while accum < target:
-                        if not repeat:
-                            avail = [p for p in lib if p not in used]
-                            if not avail:
-                                used = set()
-                                avail = lib
-                        else:
-                            avail = lib
-
-                        clip = random.choice(avail)
-                        used.add(clip)
-                        clip_dur = get_duration(clip)
-                        seg_len = random.uniform(cmin, min(cmax, clip_dur))
-                        trimmed = trim_video(clip, seg_len, tmpdir)
-                        selected.append(trimmed)
-                        accum += get_duration(trimmed)
-
                     out_path = os.path.join(tmpdir, "bg_" + str(v + 1) + "_" + uuid.uuid4().hex[:6] + ".mp4")
-                    cf = 0.3 if xfade2 else 0
-                    concat_videos(selected, w, h, out_path, tmpdir, crossfade=cf)
-                    final_path = trim_video(out_path, target, tmpdir)
-                    final_dur = get_duration(final_path)
-
-                    results.append((v + 1, final_path, final_dur, len(selected)))
+                    concat_videos(paths, w, h, out_path, tmpdir)
+                    results.append((v + 1, out_path, names))
                 except Exception as e:
                     st.error("Background " + str(v + 1) + " failed: " + str(e)[:300])
-                prog.progress((v + 1) / bgnum)
+                prog.progress((v + 1) / len(all_perms))
 
             status.text("Done. " + str(len(results)) + " backgrounds generated.")
 
-            for idx, path, dur, nc in results:
-                with st.expander("Background " + str(idx) + " (" + ("%.1f" % dur) + "s, " + str(nc) + " clips)", expanded=(idx == 1)):
+            for idx, path, names in results:
+                with st.expander("Background " + str(idx) + ": " + " > ".join(names), expanded=(idx == 1)):
                     with open(path, "rb") as f:
                         data = f.read()
                     st.video(data)
-                    st.download_button("Download Background " + str(idx), data, file_name="background_" + str(idx) + ".mp4", mime="video/mp4", key="bgdl_" + str(idx))
+                    st.download_button("Download Background " + str(idx), data,
+                                       file_name="background_" + str(idx) + ".mp4",
+                                       mime="video/mp4", key="bgdl_" + str(idx))
 
 
 # ============== TAB 3: VARIATION GENERATOR ==============
 
 with tab3:
     st.header("Variation Generator")
-    st.write("Cuts land on natural speech pauses (sentences, punch lines).")
+    st.write("Combine hooks + HeyGen avatar (green screen) + backgrounds. Cuts land on speech pauses.")
 
-    hooks = st.file_uploader("Finished hooks", type=["mp4", "mov"], accept_multiple_files=True, key="vghk")
+    hooks = st.file_uploader("Finished hooks (from Tab 1)", type=["mp4", "mov"], accept_multiple_files=True, key="vghk")
     avs = st.file_uploader("HeyGen avatar videos (green screen)", type=["mp4", "mov"], accept_multiple_files=True, key="vgav")
-    bgs = st.file_uploader("Backgrounds", type=["mp4", "mov"], accept_multiple_files=True, key="vgbg")
+    bgs = st.file_uploader("Backgrounds (from Tab 2)", type=["mp4", "mov"], accept_multiple_files=True, key="vgbg")
 
-    nvar = st.slider("How many variations?", 1, 10, 3, key="vgnum")
+    nvar = st.slider("How many variations?", 1, 20, 5, key="vgnum")
 
     with st.expander("Advanced cut settings"):
         mp_v = st.slider("Min pause for cut (seconds)", 0.10, 1.0, 0.25, 0.05, key="vgmp")
@@ -425,4 +357,6 @@ with tab3:
                     with open(path, "rb") as f:
                         data = f.read()
                     st.video(data)
-                    st.download_button("Download Variation " + str(idx), data, file_name="variation_" + str(idx) + ".mp4", mime="video/mp4", key="vgdl_" + str(idx))
+                    st.download_button("Download Variation " + str(idx), data,
+                                       file_name="variation_" + str(idx) + ".mp4",
+                                       mime="video/mp4", key="vgdl_" + str(idx))
