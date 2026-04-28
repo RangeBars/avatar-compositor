@@ -158,7 +158,6 @@ def composite_avatar(bg_path, avatar_path, w, h, output_path,
     n_segs = len(segments)
 
     parts = []
-    # Background scaled to canvas. -stream_loop on input handles looping if shorter than avatar.
     parts.append(
         "[0:v]scale=" + str(w) + ":" + str(h) +
         ":force_original_aspect_ratio=increase,crop=" + str(w) + ":" + str(h) +
@@ -202,7 +201,6 @@ def composite_avatar(bg_path, avatar_path, w, h, output_path,
         )
         chain_input = "[v" + idx + "]"
 
-    # Audio
     if bg_audio_volume > 0:
         parts.append("[0:a]volume=" + ("%.2f" % bg_audio_volume) + "[bga]")
         parts.append("[1:a]volume=1.0[ava]")
@@ -213,13 +211,10 @@ def composite_avatar(bg_path, avatar_path, w, h, output_path,
 
     full_filter = ";".join(parts)
 
-    # Make sure background has audio if we're mixing
     bg_for_input = bg_path
     if bg_audio_volume > 0 and not has_audio(bg_path):
         bg_for_input = add_silent_audio(bg_path, os.path.dirname(output_path))
 
-    # KEY PART: -stream_loop -1 on the background causes it to loop seamlessly
-    # if shorter than the avatar. -t locks output to avatar duration.
     cmd = [
         "ffmpeg", "-y",
         "-stream_loop", "-1", "-i", bg_for_input,
@@ -295,8 +290,10 @@ key_mode = st.radio(
     key="keymode"
 )
 
-key_tolerance = st.slider("Keying tolerance", 0.10, 0.50, 0.30, 0.05, key="ktol")
-key_softness = st.slider("Edge softness", 0.0, 0.50, 0.15, 0.05, key="ksoft")
+# Hardcoded keying defaults — work well for both green and white
+key_tolerance = 0.30
+key_softness = 0.15
+
 bg_audio_volume = st.slider("Background video audio volume", 0.0, 1.0, 0.30, 0.05, key="bgvol")
 
 with st.expander("Advanced cut settings"):
